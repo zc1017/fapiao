@@ -155,20 +155,41 @@ class InvoiceParser:
             
             processed_image = preprocess_image(image)
             
-            result = ocr.readtext(processed_image)
+            try:
+                result = ocr.predict(processed_image)
+            except:
+                try:
+                    result = ocr.ocr(processed_image)
+                except:
+                    result = None
             
             if not result:
-                result = ocr.readtext(image)
+                try:
+                    result = ocr.predict(image)
+                except:
+                    try:
+                        result = ocr.ocr(image)
+                    except:
+                        result = None
             
             if not result:
                 return None, 'OCR未识别到文字'
             
             all_text = []
-            for item in result:
-                if len(item) >= 2:
-                    text = item[1]
-                    confidence = item[2] if len(item) >= 3 else 1.0
-                    all_text.append((text, confidence))
+            if isinstance(result, dict) and 'rec_text' in result:
+                texts = result.get('rec_text', [])
+                for text in texts:
+                    all_text.append((text, 1.0))
+            elif isinstance(result, list) and len(result) > 0:
+                for line in result[0] if isinstance(result[0], list) else result:
+                    if line and len(line) >= 2:
+                        if isinstance(line[1], tuple) and len(line[1]) >= 2:
+                            text = line[1][0]
+                            confidence = line[1][1]
+                        else:
+                            text = str(line[1])
+                            confidence = 1.0
+                        all_text.append((text, confidence))
             
             full_text = '\n'.join([t[0] for t in all_text])
             
@@ -484,7 +505,6 @@ class InvoiceParser:
                     invoice_data['发票代码'] = parts[2] if len(parts) > 2 else ''
                     invoice_data['发票号码'] = parts[3] if len(parts) > 3 else ''
                     invoice_data['价税合计'] = parts[4] if len(parts) > 4 else ''
-                    invoice_data['合计金额'] = parts[4] if len(parts) > 4 else ''
                     invoice_data['开票日期'] = parts[5] if len(parts) > 5 else ''
                     if len(parts) > 6:
                         invoice_data['校验码'] = parts[6]
@@ -496,13 +516,13 @@ class InvoiceParser:
                     invoice_data['发票类型'] = invoice_type_map.get(type_code, f'发票类型{type_code}')
                     invoice_data['发票代码'] = parts[1]
                     invoice_data['发票号码'] = parts[2]
-                    invoice_data['合计金额'] = parts[3]
+                    invoice_data['价税合计'] = parts[3]
                     invoice_data['开票日期'] = parts[4]
                     invoice_data['校验码'] = parts[5] if len(parts) > 5 else ''
                 else:
                     invoice_data['发票代码'] = parts[0]
                     invoice_data['发票号码'] = parts[1]
-                    invoice_data['合计金额'] = parts[2]
+                    invoice_data['价税合计'] = parts[2]
                     invoice_data['开票日期'] = parts[3]
                     if len(parts) > 4:
                         invoice_data['校验码'] = parts[4]
@@ -512,7 +532,7 @@ class InvoiceParser:
             elif len(parts) >= 4:
                 invoice_data['发票代码'] = parts[0]
                 invoice_data['发票号码'] = parts[1]
-                invoice_data['合计金额'] = parts[2]
+                invoice_data['价税合计'] = parts[2]
                 invoice_data['开票日期'] = parts[3]
                 invoice_data['发票类型'] = '增值税发票'
             
@@ -1005,8 +1025,13 @@ class InvoiceMainWindow(QMainWindow):
         """实时添加一条识别结果"""
         self.invoice_results.append(result)
         
+        print(f"\n识别结果: {result.get('文件名', '')}")
+        for key, value in result.items():
+            if value and key not in ['文件路径', '二维码内容']:
+                print(f"  {key}: {value}")
+        
         headers = [
-            '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
+            '文件名', '状态', '发票类型', '发票号码', '开票日期',
             '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
             '合计金额', '合计税额', '价税合计', '错误信息'
         ]
@@ -1070,7 +1095,7 @@ class InvoiceMainWindow(QMainWindow):
             return
         
         headers = [
-            '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
+            '文件名', '状态', '发票类型', '发票号码', '开票日期',
             '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
             '合计金额', '合计税额', '价税合计', '错误信息'
         ]
@@ -1110,17 +1135,14 @@ class InvoiceMainWindow(QMainWindow):
         
         all_headers = [
             '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
-            '购买方名称', '购买方纳税人识别号', '购买方地址电话', '购买方开户行及账号',
-            '销售方名称', '销售方纳税人识别号', '销售方地址电话', '销售方开户行及账号',
-            '合计金额', '合计税额', '价税合计', '价税合计大写',
-            '收款人', '复核人', '开票人', '备注', '错误信息'
+            '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
+            '合计金额', '合计税额', '价税合计', '错误信息'
         ]
         
-        default_selected = [
-            '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
-            '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
-            '合计金额', '合计税额', '价税合计', '开票人', '备注'
-        ]
+        default_selected = all_headers.copy()
+        default_selected.remove('状态')
+        default_selected.remove('发票类型')
+        default_selected.remove('错误信息')
         
         dialog = FieldSelectDialog(all_headers, default_selected, self)
         if dialog.exec_() != QDialog.Accepted:

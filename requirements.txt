@@ -6,3 +6,5 @@ openpyxl>=3.0.0
 numpy>=1.20.0
 PyMuPDF>=1.23.0
 Pillow>=9.0.0
+paddlepaddle>=2.6.0
+paddleocr>=2.8.0
