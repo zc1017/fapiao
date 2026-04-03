@@ -46,10 +46,7 @@ def get_ocr():
             except:
                 print("使用CPU模式")
             
-            _ocr_instance = PaddleOCR(
-                lang='ch',
-                show_log=False
-            )
+            _ocr_instance = PaddleOCR(lang='ch')
             print("PaddleOCR初始化成功")
         except Exception as e:
             print(f"PaddleOCR初始化失败: {e}")
