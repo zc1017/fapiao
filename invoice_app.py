@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QProgressBar, QStatusBar, QDialog, QCheckBox, QScrollArea
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode, ZBarSymbol
@@ -155,33 +155,47 @@ class InvoiceParser:
             
             processed_image = preprocess_image(image)
             
+            print(f"\n开始OCR识别: {os.path.basename(image_path)}")
+            
             try:
                 result = ocr.predict(processed_image)
-            except:
+                print(f"OCR predict结果类型: {type(result)}")
+            except Exception as e1:
+                print(f"OCR predict失败: {e1}")
                 try:
                     result = ocr.ocr(processed_image)
-                except:
+                    print(f"OCR ocr结果类型: {type(result)}")
+                except Exception as e2:
+                    print(f"OCR ocr失败: {e2}")
                     result = None
             
             if not result:
+                print("尝试用原图识别...")
                 try:
                     result = ocr.predict(image)
-                except:
+                except Exception as e3:
+                    print(f"原图predict失败: {e3}")
                     try:
                         result = ocr.ocr(image)
-                    except:
+                    except Exception as e4:
+                        print(f"原图ocr失败: {e4}")
                         result = None
             
             if not result:
+                print("OCR未识别到任何结果")
                 return None, 'OCR未识别到文字'
+            
+            print(f"OCR结果: {result}")
             
             all_text = []
             if isinstance(result, dict) and 'rec_text' in result:
                 texts = result.get('rec_text', [])
+                print(f"rec_text: {texts}")
                 for text in texts:
                     all_text.append((text, 1.0))
             elif isinstance(result, list) and len(result) > 0:
-                for line in result[0] if isinstance(result[0], list) else result:
+                print(f"结果列表长度: {len(result)}")
+                for i, line in enumerate(result[0] if isinstance(result[0], list) else result):
                     if line and len(line) >= 2:
                         if isinstance(line[1], tuple) and len(line[1]) >= 2:
                             text = line[1][0]
@@ -190,6 +204,7 @@ class InvoiceParser:
                             text = str(line[1])
                             confidence = 1.0
                         all_text.append((text, confidence))
+                        print(f"  [{i}] {text} (置信度: {confidence:.2f})")
             
             full_text = '\n'.join([t[0] for t in all_text])
             
@@ -813,6 +828,10 @@ class InvoiceMainWindow(QMainWindow):
         self.setWindowTitle('发票识别工具')
         self.setGeometry(100, 100, 1400, 900)
         
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+        if os.path.exists(logo_path):
+            self.setWindowIcon(QIcon(logo_path))
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -1317,6 +1336,10 @@ class FieldSelectDialog(QDialog):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+    if os.path.exists(logo_path):
+        app.setWindowIcon(QIcon(logo_path))
     
     font = QFont('Microsoft YaHei', 9)
     app.setFont(font)
