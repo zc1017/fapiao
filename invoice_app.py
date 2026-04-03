@@ -185,7 +185,7 @@ class InvoiceParser:
             return None, f'获取数据失败: {str(e)}'
     
     @staticmethod
-    def ocr_extract_seller_info(image_path):
+    def ocr_extract_seller_info(image_path, existing_total_price=None):
         """使用OCR提取销售方和购买方信息"""
         try:
             ocr = get_ocr()
@@ -287,6 +287,92 @@ class InvoiceParser:
                 info['购买方纳税人识别号'] = tax_ids[0]
             if len(tax_ids) >= 2:
                 info['销售方纳税人识别号'] = tax_ids[1]
+            
+            amounts = []
+            for text in all_text:
+                if '￥' in text or '¥' in text:
+                    patterns = [
+                        r'[￥¥]\s*([\d,\s]+\.?\s*\d*)',
+                        r'([\d,\s]+\.?\s*\d*)\s*[￥¥]',
+                    ]
+                    for pattern in patterns:
+                        matches = re.findall(pattern, text)
+                        for match in matches:
+                            try:
+                                amount_str = match.replace(',', '').replace(' ', '').strip()
+                                if amount_str and '.' in amount_str:
+                                    amount = float(amount_str)
+                                    if amount > 0:
+                                        amounts.append(amount)
+                                        add_log(f"  识别到金额: {amount}", image_path)
+                            except:
+                                pass
+            
+            amounts = list(set(amounts))
+            amounts.sort(reverse=True)
+            add_log(f"所有识别到的金额: {amounts}", image_path)
+            
+            found = False
+            
+            if existing_total_price and len(amounts) >= 2:
+                total_price_value = float(existing_total_price)
+                add_log(f"已有价税合计: {total_price_value}, 尝试匹配合计金额和合计税额", image_path)
+                
+                for i in range(len(amounts)):
+                    for j in range(i + 1, len(amounts)):
+                        total_amount = amounts[i]
+                        total_tax = amounts[j]
+                        
+                        if abs(total_amount + total_tax - total_price_value) < 0.01:
+                            if total_amount > total_tax:
+                                info['合计金额'] = str(total_amount)
+                                info['合计税额'] = str(total_tax)
+                                info['价税合计'] = str(total_price_value)
+                                add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
+                                found = True
+                                break
+                    if found:
+                        break
+                
+                if not found:
+                    for i in range(len(amounts)):
+                        for j in range(i + 1, len(amounts)):
+                            total_tax = amounts[i]
+                            total_amount = amounts[j]
+                            
+                            if abs(total_amount + total_tax - total_price_value) < 0.01:
+                                info['合计金额'] = str(total_amount)
+                                info['合计税额'] = str(total_tax)
+                                info['价税合计'] = str(total_price_value)
+                                add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
+                                found = True
+                                break
+                        if found:
+                            break
+            
+            if not found and len(amounts) >= 3:
+                for i in range(len(amounts)):
+                    for j in range(i + 1, len(amounts)):
+                        for k in range(j + 1, len(amounts)):
+                            total_amount = amounts[i]
+                            total_tax = amounts[j]
+                            total_price = amounts[k]
+                            
+                            if abs(total_amount + total_tax - total_price) < 0.01:
+                                if total_amount > total_tax:
+                                    info['合计金额'] = str(total_amount)
+                                    info['合计税额'] = str(total_tax)
+                                    info['价税合计'] = str(total_price)
+                                    add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price}", image_path)
+                                    found = True
+                                    break
+                        if found:
+                            break
+                    if found:
+                        break
+                
+                if not found:
+                    add_log("未找到满足条件的金额组合", image_path)
             
             add_log(f"\n提取的信息: {info}", image_path)
             
@@ -819,9 +905,10 @@ class ProcessThread(QThread):
                 self.result_ready.emit(result)
                 continue
             
-            if not invoice_data.get('销售方名称') or not invoice_data.get('销售方纳税人识别号') or not invoice_data.get('购买方名称') or not invoice_data.get('购买方纳税人识别号'):
+            if not invoice_data.get('销售方名称') or not invoice_data.get('销售方纳税人识别号') or not invoice_data.get('购买方名称') or not invoice_data.get('购买方纳税人识别号') or not invoice_data.get('合计金额') or not invoice_data.get('合计税额'):
                 add_log(f"缺少必要信息，启动OCR补充识别", file_path)
-                ocr_info, ocr_error = InvoiceParser.ocr_extract_seller_info(file_path)
+                existing_total_price = invoice_data.get('价税合计')
+                ocr_info, ocr_error = InvoiceParser.ocr_extract_seller_info(file_path, existing_total_price)
                 if ocr_info:
                     if not invoice_data.get('销售方名称') and ocr_info.get('销售方名称'):
                         invoice_data['销售方名称'] = ocr_info['销售方名称']
@@ -831,6 +918,12 @@ class ProcessThread(QThread):
                         invoice_data['购买方名称'] = ocr_info['购买方名称']
                     if not invoice_data.get('购买方纳税人识别号') and ocr_info.get('购买方纳税人识别号'):
                         invoice_data['购买方纳税人识别号'] = ocr_info['购买方纳税人识别号']
+                    if not invoice_data.get('合计金额') and ocr_info.get('合计金额'):
+                        invoice_data['合计金额'] = ocr_info['合计金额']
+                    if not invoice_data.get('合计税额') and ocr_info.get('合计税额'):
+                        invoice_data['合计税额'] = ocr_info['合计税额']
+                    if not invoice_data.get('价税合计') and ocr_info.get('价税合计'):
+                        invoice_data['价税合计'] = ocr_info['价税合计']
             
             if invoice_data.get('购买方名称') == '深圳市城图科技有限公司' and invoice_data.get('购买方纳税人识别号') != '91440300665885384A':
                 add_log(f"购买方为深圳市城图科技有限公司，修正纳税人识别号", file_path)
