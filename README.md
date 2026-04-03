@@ -106,8 +106,6 @@ fapiao/
 ├── invoice_app.py          # 主程序
 ├── requirements.txt        # 依赖列表
 ├── 启动.bat                # 启动脚本
-├── tax_query.py           # 税务局查询模块(可选)
-├── tax_login.py           # 自动登录模块(可选)
 └── README.md              # 说明文档
 ```
 
