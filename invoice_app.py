@@ -1050,6 +1050,12 @@ class InvoiceMainWindow(QMainWindow):
         self.btn_clear_results.setMinimumWidth(100)
         self.btn_clear_results.setEnabled(False)
         
+        self.btn_retry_failed = QPushButton('重试失败')
+        self.btn_retry_failed.clicked.connect(self.retry_failed)
+        self.btn_retry_failed.setMinimumHeight(40)
+        self.btn_retry_failed.setMinimumWidth(100)
+        self.btn_retry_failed.setEnabled(False)
+        
         toolbar_layout.addWidget(self.btn_add)
         toolbar_layout.addWidget(self.btn_add_folder)
         toolbar_layout.addWidget(self.btn_remove)
@@ -1059,6 +1065,7 @@ class InvoiceMainWindow(QMainWindow):
         toolbar_layout.addStretch()
         toolbar_layout.addWidget(self.btn_export)
         toolbar_layout.addWidget(self.btn_view_log)
+        toolbar_layout.addWidget(self.btn_retry_failed)
         toolbar_layout.addWidget(self.btn_clear_results)
         
         main_layout.addWidget(toolbar_widget)
@@ -1291,7 +1298,49 @@ class InvoiceMainWindow(QMainWindow):
         self.result_count_label.setText('共 0 条记录')
         self.btn_export.setEnabled(False)
         self.btn_clear_results.setEnabled(False)
+        self.btn_retry_failed.setEnabled(False)
         self.status_bar.showMessage('识别结果已清空')
+    
+    def retry_failed(self):
+        """重新识别失败的文件"""
+        failed_files = [r.get('文件路径') for r in self.invoice_results if r.get('状态') == '失败']
+        
+        if not failed_files:
+            QMessageBox.information(self, '提示', '没有失败的记录需要重新识别！')
+            return
+        
+        reply = QMessageBox.question(
+            self, '确认重试',
+            f'确定要重新识别 {len(failed_files)} 个失败的文件吗？',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+        
+        self.invoice_results = [r for r in self.invoice_results if r.get('状态') == '成功']
+        
+        if not self.invoice_results:
+            self.result_table.setRowCount(0)
+            self.result_count_label.setText('共 0 条记录')
+            self.btn_export.setEnabled(False)
+            self.btn_clear_results.setEnabled(False)
+        
+        self.status_bar.showMessage(f'正在重新识别 {len(failed_files)} 个失败的文件...')
+        
+        self.btn_process.setEnabled(False)
+        self.btn_add.setEnabled(False)
+        self.btn_add_folder.setEnabled(False)
+        self.btn_remove.setEnabled(False)
+        self.btn_clear.setEnabled(False)
+        self.btn_retry_failed.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        self.process_thread = ProcessThread(failed_files)
+        self.process_thread.progress.connect(self.update_progress)
+        self.process_thread.result_ready.connect(self.add_result)
+        self.process_thread.finished.connect(self.on_process_finished)
+        self.process_thread.start()
     
     def update_file_count(self):
         self.file_count_label.setText(f'共 {len(self.file_list)} 个文件')
@@ -1394,11 +1443,14 @@ class InvoiceMainWindow(QMainWindow):
         self.result_count_label.setText(f'共 {len(self.invoice_results)} 条记录')
         
         success_count = sum(1 for r in self.invoice_results if r.get('状态') == '成功')
-        self.status_bar.showMessage(f'识别中: 成功 {success_count} 个, 失败 {len(self.invoice_results) - success_count} 个')
+        failed_count = len(self.invoice_results) - success_count
+        self.status_bar.showMessage(f'识别中: 成功 {success_count} 个, 失败 {failed_count} 个')
         
         if self.invoice_results:
             self.btn_export.setEnabled(True)
             self.btn_clear_results.setEnabled(True)
+            if failed_count > 0:
+                self.btn_retry_failed.setEnabled(True)
     
     def on_process_finished(self, results):
         for result in results:
