@@ -8,6 +8,8 @@ import tempfile
 import urllib.request
 import urllib.error
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QTableWidget, QTableWidgetItem,
@@ -29,44 +31,52 @@ import io
 _ocr_instance = None
 _log_messages = []
 _file_logs = {}
+_log_lock = threading.Lock()
+_ocr_lock = threading.Lock()
 
 def add_log(message, file_path=None):
-    """添加日志消息"""
-    global _log_messages, _file_logs
-    _log_messages.append(message)
-    if file_path:
-        if file_path not in _file_logs:
-            _file_logs[file_path] = []
-        _file_logs[file_path].append(message)
+    """添加日志消息（线程安全）"""
+    global _log_messages, _file_logs, _log_lock
+    with _log_lock:
+        _log_messages.append(message)
+        if file_path:
+            if file_path not in _file_logs:
+                _file_logs[file_path] = []
+            _file_logs[file_path].append(message)
     print(message)
 
 def get_logs():
-    """获取所有日志消息"""
-    global _log_messages
-    return '\n'.join(_log_messages)
+    """获取所有日志消息（线程安全）"""
+    global _log_messages, _log_lock
+    with _log_lock:
+        return '\n'.join(_log_messages)
 
 def get_file_logs(file_path):
-    """获取指定文件的日志消息"""
-    global _file_logs
-    return '\n'.join(_file_logs.get(file_path, []))
+    """获取指定文件的日志消息（线程安全）"""
+    global _file_logs, _log_lock
+    with _log_lock:
+        return '\n'.join(_file_logs.get(file_path, []))
 
 def clear_logs():
-    """清空日志消息"""
-    global _log_messages, _file_logs
-    _log_messages = []
-    _file_logs = {}
+    """清空日志消息（线程安全）"""
+    global _log_messages, _file_logs, _log_lock
+    with _log_lock:
+        _log_messages = []
+        _file_logs = {}
 
 def get_ocr():
-    global _ocr_instance
-    if _ocr_instance is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _ocr_instance = RapidOCR()
-            add_log("RapidOCR初始化成功")
-        except Exception as e:
-            add_log(f"RapidOCR初始化失败: {e}")
-            return None
-    return _ocr_instance
+    """获取OCR实例（线程安全）"""
+    global _ocr_instance, _ocr_lock
+    with _ocr_lock:
+        if _ocr_instance is None:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                _ocr_instance = RapidOCR()
+                add_log("RapidOCR初始化成功")
+            except Exception as e:
+                add_log(f"RapidOCR初始化失败: {e}")
+                return None
+        return _ocr_instance
 
 
 class StatusTagDelegate(QStyledItemDelegate):
@@ -850,94 +860,123 @@ class ProcessThread(QThread):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     
-    def __init__(self, files):
+    def __init__(self, files, max_workers=4):
         super().__init__()
         self.files = files
+        self.max_workers = max_workers
+        self.results_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.completed_count = 0
     
-    def run(self):
-        results = []
-        total = len(self.files)
+    def process_single_file(self, file_path):
+        """处理单个发票文件"""
+        add_log(f"\n========== 开始处理: {os.path.basename(file_path)} ==========", file_path)
         
-        for i, file_path in enumerate(self.files):
-            self.progress.emit(i + 1, total)
-            add_log(f"\n========== 开始处理: {os.path.basename(file_path)} ==========", file_path)
-            
-            qrcode_data, qrcode_error = InvoiceParser.decode_qrcode(file_path)
-            if not qrcode_data:
-                add_log(f"二维码识别失败: {qrcode_error or '无法识别二维码'}", file_path)
+        qrcode_data, qrcode_error = InvoiceParser.decode_qrcode(file_path)
+        if not qrcode_data:
+            add_log(f"二维码识别失败: {qrcode_error or '无法识别二维码'}", file_path)
+            result = {
+                '文件名': os.path.basename(file_path),
+                '文件路径': file_path,
+                '状态': '失败',
+                '识别日志': get_file_logs(file_path)
+            }
+            return result
+        
+        add_log(f"二维码识别成功", file_path)
+        invoice_data, parse_error = InvoiceParser.parse_invoice_qrcode(qrcode_data)
+        
+        if isinstance(invoice_data, str):
+            xml_content = invoice_data
+            invoice_data = InvoiceParser.parse_xml_to_dict(xml_content)
+            if not invoice_data:
+                add_log(f"XML解析失败", file_path)
                 result = {
                     '文件名': os.path.basename(file_path),
                     '文件路径': file_path,
                     '状态': '失败',
                     '识别日志': get_file_logs(file_path)
                 }
-                results.append(result)
-                self.result_ready.emit(result)
-                continue
+                return result
+        
+        if not invoice_data:
+            add_log(f"发票数据解析失败: {parse_error or '无法解析发票数据'}", file_path)
+            result = {
+                '文件名': os.path.basename(file_path),
+                '文件路径': file_path,
+                '状态': '失败',
+                '识别日志': get_file_logs(file_path)
+            }
+            return result
+        
+        if not invoice_data.get('销售方名称') or not invoice_data.get('销售方纳税人识别号') or not invoice_data.get('购买方名称') or not invoice_data.get('购买方纳税人识别号') or not invoice_data.get('合计金额') or not invoice_data.get('合计税额'):
+            add_log(f"缺少必要信息，启动OCR补充识别", file_path)
+            existing_total_price = invoice_data.get('价税合计')
+            ocr_info, ocr_error = InvoiceParser.ocr_extract_seller_info(file_path, existing_total_price)
+            if ocr_info:
+                if not invoice_data.get('销售方名称') and ocr_info.get('销售方名称'):
+                    invoice_data['销售方名称'] = ocr_info['销售方名称']
+                if not invoice_data.get('销售方纳税人识别号') and ocr_info.get('销售方纳税人识别号'):
+                    invoice_data['销售方纳税人识别号'] = ocr_info['销售方纳税人识别号']
+                if not invoice_data.get('购买方名称') and ocr_info.get('购买方名称'):
+                    invoice_data['购买方名称'] = ocr_info['购买方名称']
+                if not invoice_data.get('购买方纳税人识别号') and ocr_info.get('购买方纳税人识别号'):
+                    invoice_data['购买方纳税人识别号'] = ocr_info['购买方纳税人识别号']
+                if not invoice_data.get('合计金额') and ocr_info.get('合计金额'):
+                    invoice_data['合计金额'] = ocr_info['合计金额']
+                if not invoice_data.get('合计税额') and ocr_info.get('合计税额'):
+                    invoice_data['合计税额'] = ocr_info['合计税额']
+                if not invoice_data.get('价税合计') and ocr_info.get('价税合计'):
+                    invoice_data['价税合计'] = ocr_info['价税合计']
+        
+        if invoice_data.get('购买方名称') == '深圳市城图科技有限公司' and invoice_data.get('购买方纳税人识别号') != '91440300665885384A':
+            add_log(f"购买方为深圳市城图科技有限公司，修正纳税人识别号", file_path)
+            if invoice_data.get('购买方纳税人识别号'):
+                invoice_data['销售方纳税人识别号'] = invoice_data['购买方纳税人识别号']
+            invoice_data['购买方纳税人识别号'] = '91440300665885384A'
+        
+        invoice_data['文件名'] = os.path.basename(file_path)
+        invoice_data['文件路径'] = file_path
+        invoice_data['状态'] = '成功'
+        add_log(f"识别成功", file_path)
+        invoice_data['识别日志'] = get_file_logs(file_path)
+        
+        return invoice_data
+    
+    def run(self):
+        """使用多线程并发处理发票"""
+        results = []
+        total = len(self.files)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_file = {executor.submit(self.process_single_file, file_path): file_path 
+                            for file_path in self.files}
             
-            add_log(f"二维码识别成功", file_path)
-            invoice_data, parse_error = InvoiceParser.parse_invoice_qrcode(qrcode_data)
-            
-            if isinstance(invoice_data, str):
-                xml_content = invoice_data
-                invoice_data = InvoiceParser.parse_xml_to_dict(xml_content)
-                if not invoice_data:
-                    add_log(f"XML解析失败", file_path)
-                    result = {
+            for future in as_completed(future_to_file):
+                try:
+                    result = future.result()
+                    
+                    with self.results_lock:
+                        results.append(result)
+                    
+                    self.result_ready.emit(result)
+                    
+                    with self.progress_lock:
+                        self.completed_count += 1
+                        self.progress.emit(self.completed_count, total)
+                
+                except Exception as e:
+                    file_path = future_to_file[future]
+                    add_log(f"处理文件出错: {str(e)}", file_path)
+                    error_result = {
                         '文件名': os.path.basename(file_path),
                         '文件路径': file_path,
                         '状态': '失败',
                         '识别日志': get_file_logs(file_path)
                     }
-                    results.append(result)
-                    self.result_ready.emit(result)
-                    continue
-            
-            if not invoice_data:
-                add_log(f"发票数据解析失败: {parse_error or '无法解析发票数据'}", file_path)
-                result = {
-                    '文件名': os.path.basename(file_path),
-                    '文件路径': file_path,
-                    '状态': '失败',
-                    '识别日志': get_file_logs(file_path)
-                }
-                results.append(result)
-                self.result_ready.emit(result)
-                continue
-            
-            if not invoice_data.get('销售方名称') or not invoice_data.get('销售方纳税人识别号') or not invoice_data.get('购买方名称') or not invoice_data.get('购买方纳税人识别号') or not invoice_data.get('合计金额') or not invoice_data.get('合计税额'):
-                add_log(f"缺少必要信息，启动OCR补充识别", file_path)
-                existing_total_price = invoice_data.get('价税合计')
-                ocr_info, ocr_error = InvoiceParser.ocr_extract_seller_info(file_path, existing_total_price)
-                if ocr_info:
-                    if not invoice_data.get('销售方名称') and ocr_info.get('销售方名称'):
-                        invoice_data['销售方名称'] = ocr_info['销售方名称']
-                    if not invoice_data.get('销售方纳税人识别号') and ocr_info.get('销售方纳税人识别号'):
-                        invoice_data['销售方纳税人识别号'] = ocr_info['销售方纳税人识别号']
-                    if not invoice_data.get('购买方名称') and ocr_info.get('购买方名称'):
-                        invoice_data['购买方名称'] = ocr_info['购买方名称']
-                    if not invoice_data.get('购买方纳税人识别号') and ocr_info.get('购买方纳税人识别号'):
-                        invoice_data['购买方纳税人识别号'] = ocr_info['购买方纳税人识别号']
-                    if not invoice_data.get('合计金额') and ocr_info.get('合计金额'):
-                        invoice_data['合计金额'] = ocr_info['合计金额']
-                    if not invoice_data.get('合计税额') and ocr_info.get('合计税额'):
-                        invoice_data['合计税额'] = ocr_info['合计税额']
-                    if not invoice_data.get('价税合计') and ocr_info.get('价税合计'):
-                        invoice_data['价税合计'] = ocr_info['价税合计']
-            
-            if invoice_data.get('购买方名称') == '深圳市城图科技有限公司' and invoice_data.get('购买方纳税人识别号') != '91440300665885384A':
-                add_log(f"购买方为深圳市城图科技有限公司，修正纳税人识别号", file_path)
-                if invoice_data.get('购买方纳税人识别号'):
-                    invoice_data['销售方纳税人识别号'] = invoice_data['购买方纳税人识别号']
-                invoice_data['购买方纳税人识别号'] = '91440300665885384A'
-            
-            invoice_data['文件名'] = os.path.basename(file_path)
-            invoice_data['文件路径'] = file_path
-            invoice_data['状态'] = '成功'
-            add_log(f"识别成功", file_path)
-            invoice_data['识别日志'] = get_file_logs(file_path)
-            results.append(invoice_data)
-            self.result_ready.emit(invoice_data)
+                    with self.results_lock:
+                        results.append(error_result)
+                    self.result_ready.emit(error_result)
         
         self.finished.emit(results)
 
@@ -1064,7 +1103,7 @@ class InvoiceMainWindow(QMainWindow):
         self.result_table.setAlternatingRowColors(True)
         self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.result_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
-        self.result_table.cellDoubleClicked.connect(self.on_cell_double_clicked)
+        self.result_table.cellClicked.connect(self.on_cell_clicked)
         self.result_table.cellChanged.connect(self.on_cell_changed)
         result_layout.addWidget(self.result_table)
         
@@ -1074,8 +1113,8 @@ class InvoiceMainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('就绪')
     
-    def on_cell_double_clicked(self, row, col):
-        """双击单元格"""
+    def on_cell_clicked(self, row, col):
+        """单击单元格"""
         headers = [
             '文件名', '状态', '发票号码', '开票日期',
             '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
