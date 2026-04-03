@@ -12,10 +12,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QLabel, QListWidget, QListWidgetItem,
-    QSplitter, QProgressBar, QStatusBar
+    QSplitter, QProgressBar, QStatusBar, QDialog, QCheckBox, QScrollArea
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode, ZBarSymbol
@@ -31,10 +31,28 @@ def get_ocr():
     global _ocr_instance
     if _ocr_instance is None:
         try:
-            import easyocr
-            _ocr_instance = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+            from paddleocr import PaddleOCR
+            import paddle
+            
+            try:
+                if paddle.is_compiled_with_cuda():
+                    paddle.device.set_device('gpu')
+                    print("检测到NVIDIA GPU，使用GPU加速")
+                elif hasattr(paddle.device, 'is_compiled_with_rocm') and paddle.device.is_compiled_with_rocm():
+                    paddle.device.set_device('gpu:gpu')
+                    print("检测到AMD GPU，使用GPU加速")
+                else:
+                    print("使用CPU模式")
+            except:
+                print("使用CPU模式")
+            
+            _ocr_instance = PaddleOCR(
+                lang='ch',
+                show_log=False
+            )
+            print("PaddleOCR初始化成功")
         except Exception as e:
-            print(f"OCR初始化失败: {e}")
+            print(f"PaddleOCR初始化失败: {e}")
             return None
     return _ocr_instance
 
@@ -98,7 +116,7 @@ class InvoiceParser:
     
     @staticmethod
     def ocr_extract_seller_info(image_path):
-        """使用OCR提取销售方信息"""
+        """使用OCR提取销售方和购买方信息"""
         try:
             ocr = get_ocr()
             if ocr is None:
@@ -107,7 +125,7 @@ class InvoiceParser:
             if image_path.lower().endswith('.pdf'):
                 doc = fitz.open(image_path)
                 page = doc.load_page(0)
-                mat = fitz.Matrix(2.0, 2.0)
+                mat = fitz.Matrix(3.0, 3.0)
                 pix = page.get_pixmap(matrix=mat)
                 img_data = pix.tobytes("png")
                 nparr = np.frombuffer(img_data, np.uint8)
@@ -119,7 +137,31 @@ class InvoiceParser:
             if image is None:
                 return None, '无法读取图片'
             
-            result = ocr.readtext(image)
+            def preprocess_image(img):
+                """图像预处理提高OCR准确度"""
+                if len(img.shape) == 3:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = img.copy()
+                
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                enhanced = clahe.apply(gray)
+                
+                denoised = cv2.fastNlMeansDenoising(enhanced, None, h=10, searchWindowSize=21, templateWindowSize=7)
+                
+                _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                sharpened = cv2.filter2D(binary, -1, kernel)
+                
+                return sharpened
+            
+            processed_image = preprocess_image(image)
+            
+            result = ocr.readtext(processed_image)
+            
+            if not result:
+                result = ocr.readtext(image)
             
             if not result:
                 return None, 'OCR未识别到文字'
@@ -128,11 +170,12 @@ class InvoiceParser:
             for item in result:
                 if len(item) >= 2:
                     text = item[1]
-                    all_text.append(text)
+                    confidence = item[2] if len(item) >= 3 else 1.0
+                    all_text.append((text, confidence))
             
-            full_text = '\n'.join(all_text)
+            full_text = '\n'.join([t[0] for t in all_text])
             
-            seller_info = {}
+            info = {}
             
             tax_id_pattern = r'[0-9A-Z]{15,20}|[0-9]{15,20}'
             tax_ids = re.findall(tax_id_pattern, full_text)
@@ -148,30 +191,112 @@ class InvoiceParser:
                 if '购买方' in line or '付款方' in line or '收票方' in line:
                     buyer_idx = i
             
+            company_keywords = ['有限公司', '有限责任公司', '股份公司', '集团', '公司', '旅行社', '酒店', '餐厅', '超市', '商场', '银行', '保险', '医院', '学校', '大学', '研究所', '中心', '店', '部', '厂', '社', '院', '所', '站', '馆', '场', '分公司']
+            
+            def is_company_name(text):
+                if len(text) < 3:
+                    return False
+                if re.match(r'^[0-9\-]+$', text):
+                    return False
+                if re.match(r'^[A-Z0-9]+$', text) and len(text) < 5:
+                    return False
+                for kw in company_keywords:
+                    if kw in text:
+                        return True
+                if re.search(r'[省市县区].*[店社厂院]', text):
+                    return True
+                return False
+            
+            def clean_company_name(text):
+                text = re.sub(r'^[名称：:\s]+', '', text)
+                text = re.sub(r'[名称：:\s]+$', '', text)
+                text = text.strip()
+                
+                ocr_corrections = {
+                    '汊': '汉',
+                    '卄': '廿',
+                    '〇': '零',
+                    '①': '一',
+                    '②': '二',
+                    '③': '三',
+                    '④': '四',
+                    '⑤': '五',
+                    '⑥': '六',
+                    '⑦': '七',
+                    '⑧': '八',
+                    '⑨': '九',
+                    '㈠': '一',
+                    '㈡': '二',
+                    '㈢': '三',
+                    '㈣': '四',
+                    '㈤': '五',
+                    '㈥': '六',
+                    '㈦': '七',
+                    '㈧': '八',
+                    '㈨': '九',
+                    '．': '.',
+                    '－': '-',
+                    '（': '(',
+                    '）': ')',
+                    '［': '[',
+                    '］': ']',
+                    '｛': '{',
+                    '｝': '}',
+                    '，': ',',
+                    '：': ':',
+                    '；': ';',
+                }
+                
+                for wrong, correct in ocr_corrections.items():
+                    text = text.replace(wrong, correct)
+                
+                return text
+            
             names = []
             for i, line in enumerate(lines):
-                if '名称' in line:
-                    name_match = re.search(r'名称[：:\s]*([^\s]+)', line)
+                line = line.strip()
+                if is_company_name(line):
+                    names.append((i, line))
+                elif '名称' in line:
+                    name_match = re.search(r'名称[：:\s]*(.+?)(?:\s|$|纳税人|地址|电话|统一)', line)
                     if name_match:
-                        name = name_match.group(1).strip()
-                        if len(name) > 2:
+                        name = clean_company_name(name_match.group(1))
+                        if len(name) > 2 and is_company_name(name):
                             names.append((i, name))
-                    elif i + 1 < len(lines):
-                        next_line = lines[i + 1].strip()
-                        if len(next_line) > 2 and '纳税' not in next_line and '地址' not in next_line:
-                            names.append((i, next_line))
             
-            if seller_idx >= 0:
-                for idx, name in names:
-                    if idx > seller_idx and idx < seller_idx + 10:
-                        seller_info['销售方名称'] = name
+            if not names:
+                for i, line in enumerate(lines):
+                    line = line.strip()
+                    if is_company_name(line):
+                        names.append((i, line))
+            
+            company_names = [(idx, name) for idx, name in names if is_company_name(name)]
+            
+            if len(company_names) >= 2:
+                info['销售方名称'] = company_names[-1][1]
+                info['购买方名称'] = company_names[0][1]
+            elif seller_idx >= 0 and buyer_idx >= 0:
+                seller_names = [(idx, name) for idx, name in company_names if seller_idx < idx < buyer_idx]
+                buyer_names = [(idx, name) for idx, name in company_names if idx > buyer_idx]
+                
+                if seller_names:
+                    info['销售方名称'] = seller_names[0][1]
+                if buyer_names:
+                    info['购买方名称'] = buyer_names[0][1]
+            elif seller_idx >= 0:
+                for idx, name in company_names:
+                    if idx > seller_idx and idx < seller_idx + 15:
+                        info['销售方名称'] = name
                         break
+                
+                if '销售方名称' not in info:
+                    for idx, name in names:
+                        if idx > seller_idx and idx < seller_idx + 15:
+                            info['销售方名称'] = name
+                            break
             
-            if '销售方名称' not in seller_info and len(names) >= 2:
-                seller_info['销售方名称'] = names[-1][1]
-            
-            if '销售方名称' not in seller_info and names:
-                seller_info['销售方名称'] = names[0][1]
+            if '销售方名称' not in info and company_names:
+                info['销售方名称'] = company_names[-1][1]
             
             if tax_ids:
                 if seller_idx >= 0 and buyer_idx >= 0:
@@ -179,16 +304,17 @@ class InvoiceParser:
                         for i, line in enumerate(lines):
                             if tax_id in line:
                                 if abs(i - seller_idx) < abs(i - buyer_idx):
-                                    seller_info['销售方纳税人识别号'] = tax_id
-                                    break
-                        if '销售方纳税人识别号' in seller_info:
-                            break
+                                    info['销售方纳税人识别号'] = tax_id
+                                else:
+                                    info['购买方纳税人识别号'] = tax_id
+                                break
                 elif len(tax_ids) >= 2:
-                    seller_info['销售方纳税人识别号'] = tax_ids[-1]
+                    info['销售方纳税人识别号'] = tax_ids[-1]
+                    info['购买方纳税人识别号'] = tax_ids[0]
                 else:
-                    seller_info['销售方纳税人识别号'] = tax_ids[0]
+                    info['销售方纳税人识别号'] = tax_ids[0]
             
-            return seller_info if seller_info else None, None
+            return info if info else None, None
             
         except Exception as e:
             return None, f'OCR识别错误: {str(e)}'
@@ -581,6 +707,7 @@ class InvoiceParser:
 class ProcessThread(QThread):
     """处理发票的线程"""
     progress = pyqtSignal(int, int)
+    result_ready = pyqtSignal(dict)
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     
@@ -597,11 +724,14 @@ class ProcessThread(QThread):
             
             qrcode_data, qrcode_error = InvoiceParser.decode_qrcode(file_path)
             if not qrcode_data:
-                results.append({
+                result = {
                     '文件名': os.path.basename(file_path),
+                    '文件路径': file_path,
                     '状态': '失败',
                     '错误信息': qrcode_error or '无法识别二维码'
-                })
+                }
+                results.append(result)
+                self.result_ready.emit(result)
                 continue
             
             invoice_data, parse_error = InvoiceParser.parse_invoice_qrcode(qrcode_data)
@@ -610,33 +740,45 @@ class ProcessThread(QThread):
                 xml_content = invoice_data
                 invoice_data = InvoiceParser.parse_xml_to_dict(xml_content)
                 if not invoice_data:
-                    results.append({
+                    result = {
                         '文件名': os.path.basename(file_path),
+                        '文件路径': file_path,
                         '状态': '失败',
                         '错误信息': '无法解析XML数据'
-                    })
+                    }
+                    results.append(result)
+                    self.result_ready.emit(result)
                     continue
             
             if not invoice_data:
-                results.append({
+                result = {
                     '文件名': os.path.basename(file_path),
+                    '文件路径': file_path,
                     '状态': '失败',
                     '错误信息': parse_error or '无法解析发票数据'
-                })
+                }
+                results.append(result)
+                self.result_ready.emit(result)
                 continue
             
-            if not invoice_data.get('销售方名称') or not invoice_data.get('销售方纳税人识别号'):
+            if not invoice_data.get('销售方名称') or not invoice_data.get('销售方纳税人识别号') or not invoice_data.get('购买方名称') or not invoice_data.get('购买方纳税人识别号'):
                 ocr_info, ocr_error = InvoiceParser.ocr_extract_seller_info(file_path)
                 if ocr_info:
                     if not invoice_data.get('销售方名称') and ocr_info.get('销售方名称'):
                         invoice_data['销售方名称'] = ocr_info['销售方名称']
                     if not invoice_data.get('销售方纳税人识别号') and ocr_info.get('销售方纳税人识别号'):
                         invoice_data['销售方纳税人识别号'] = ocr_info['销售方纳税人识别号']
+                    if not invoice_data.get('购买方名称') and ocr_info.get('购买方名称'):
+                        invoice_data['购买方名称'] = ocr_info['购买方名称']
+                    if not invoice_data.get('购买方纳税人识别号') and ocr_info.get('购买方纳税人识别号'):
+                        invoice_data['购买方纳税人识别号'] = ocr_info['购买方纳税人识别号']
             
             invoice_data['文件名'] = os.path.basename(file_path)
+            invoice_data['文件路径'] = file_path
             invoice_data['状态'] = '成功'
             invoice_data['错误信息'] = ''
             results.append(invoice_data)
+            self.result_ready.emit(invoice_data)
         
         self.finished.emit(results)
 
@@ -745,7 +887,9 @@ class InvoiceMainWindow(QMainWindow):
         self.result_table = QTableWidget()
         self.result_table.setAlternatingRowColors(True)
         self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.result_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.result_table.cellDoubleClicked.connect(self.on_cell_double_clicked)
+        self.result_table.cellChanged.connect(self.on_cell_changed)
         result_layout.addWidget(self.result_table)
         
         main_layout.addWidget(result_section, 1)
@@ -753,6 +897,40 @@ class InvoiceMainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('就绪')
+    
+    def on_cell_double_clicked(self, row, col):
+        """双击单元格"""
+        if col == 0:
+            if row < len(self.invoice_results):
+                result = self.invoice_results[row]
+                file_path = result.get('文件路径', '')
+                if file_path and os.path.exists(file_path):
+                    import subprocess
+                    import platform
+                    try:
+                        if platform.system() == 'Windows':
+                            os.startfile(file_path)
+                        elif platform.system() == 'Darwin':
+                            subprocess.run(['open', file_path])
+                        else:
+                            subprocess.run(['xdg-open', file_path])
+                    except Exception as e:
+                        QMessageBox.warning(self, '提示', f'无法打开文件: {str(e)}')
+                else:
+                    QMessageBox.warning(self, '提示', '文件路径不存在')
+    
+    def on_cell_changed(self, row, col):
+        """单元格内容改变时保存"""
+        if row < len(self.invoice_results):
+            headers = [
+                '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
+                '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
+                '合计金额', '合计税额', '价税合计', '错误信息'
+            ]
+            if col < len(headers):
+                item = self.result_table.item(row, col)
+                if item:
+                    self.invoice_results[row][headers[col]] = item.text()
     
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -817,6 +995,7 @@ class InvoiceMainWindow(QMainWindow):
         
         self.process_thread = ProcessThread(self.file_list.copy())
         self.process_thread.progress.connect(self.update_progress)
+        self.process_thread.result_ready.connect(self.add_result)
         self.process_thread.finished.connect(self.on_process_finished)
         self.process_thread.start()
     
@@ -824,6 +1003,55 @@ class InvoiceMainWindow(QMainWindow):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
         self.status_bar.showMessage(f'正在识别: {current}/{total}')
+    
+    def add_result(self, result):
+        """实时添加一条识别结果"""
+        self.invoice_results.append(result)
+        
+        headers = [
+            '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
+            '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
+            '合计金额', '合计税额', '价税合计', '错误信息'
+        ]
+        
+        if self.result_table.columnCount() == 0:
+            self.result_table.setColumnCount(len(headers))
+            self.result_table.setHorizontalHeaderLabels(headers)
+        
+        self.result_table.blockSignals(True)
+        
+        row = self.result_table.rowCount()
+        self.result_table.insertRow(row)
+        
+        for col, header in enumerate(headers):
+            value = result.get(header, '')
+            item = QTableWidgetItem(str(value) if value else '')
+            if header == '状态':
+                if value == '成功':
+                    item.setBackground(Qt.green)
+                else:
+                    item.setBackground(Qt.red)
+            elif header == '文件名':
+                item.setForeground(QColor(0, 0, 255))
+                font = item.font()
+                font.setUnderline(True)
+                item.setFont(font)
+                file_path = result.get('文件路径', '')
+                if file_path:
+                    item.setToolTip(f'双击打开: {file_path}')
+            self.result_table.setItem(row, col, item)
+        
+        self.result_table.blockSignals(False)
+        
+        header = self.result_table.horizontalHeader()
+        for i in range(len(headers)):
+            header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        self.result_table.resizeColumnsToContents()
+        
+        self.result_count_label.setText(f'共 {len(self.invoice_results)} 条记录')
+        
+        success_count = sum(1 for r in self.invoice_results if r.get('状态') == '成功')
+        self.status_bar.showMessage(f'识别中: 成功 {success_count} 个, 失败 {len(self.invoice_results) - success_count} 个')
     
     def on_process_finished(self, results):
         self.invoice_results = results
@@ -847,7 +1075,7 @@ class InvoiceMainWindow(QMainWindow):
         headers = [
             '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
             '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
-            '合计金额', '合计税额', '价税合计', '开票人', '备注', '错误信息'
+            '合计金额', '合计税额', '价税合计', '错误信息'
         ]
         
         self.result_table.setColumnCount(len(headers))
@@ -863,6 +1091,14 @@ class InvoiceMainWindow(QMainWindow):
                         item.setBackground(Qt.green)
                     else:
                         item.setBackground(Qt.red)
+                elif header == '文件名':
+                    item.setForeground(QColor(0, 0, 255))
+                    font = item.font()
+                    font.setUnderline(True)
+                    item.setFont(font)
+                    file_path = result.get('文件路径', '')
+                    if file_path:
+                        item.setToolTip(f'双击打开: {file_path}')
                 self.result_table.setItem(row, col, item)
         
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -873,6 +1109,29 @@ class InvoiceMainWindow(QMainWindow):
     def export_to_excel(self):
         if not self.invoice_results:
             QMessageBox.warning(self, '提示', '没有可导出的数据！')
+            return
+        
+        all_headers = [
+            '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
+            '购买方名称', '购买方纳税人识别号', '购买方地址电话', '购买方开户行及账号',
+            '销售方名称', '销售方纳税人识别号', '销售方地址电话', '销售方开户行及账号',
+            '合计金额', '合计税额', '价税合计', '价税合计大写',
+            '收款人', '复核人', '开票人', '备注', '错误信息'
+        ]
+        
+        default_selected = [
+            '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
+            '购买方名称', '购买方纳税人识别号', '销售方名称', '销售方纳税人识别号',
+            '合计金额', '合计税额', '价税合计', '开票人', '备注'
+        ]
+        
+        dialog = FieldSelectDialog(all_headers, default_selected, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        
+        selected_headers = dialog.get_selected_fields()
+        if not selected_headers:
+            QMessageBox.warning(self, '提示', '请至少选择一个字段！')
             return
         
         default_name = f'发票识别结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
@@ -891,14 +1150,6 @@ class InvoiceMainWindow(QMainWindow):
             ws = wb.active
             ws.title = '发票信息'
             
-            headers = [
-                '文件名', '状态', '发票类型', '发票代码', '发票号码', '开票日期',
-                '购买方名称', '购买方纳税人识别号', '购买方地址电话', '购买方开户行及账号',
-                '销售方名称', '销售方纳税人识别号', '销售方地址电话', '销售方开户行及账号',
-                '合计金额', '合计税额', '价税合计', '价税合计大写',
-                '开票人', '备注', '错误信息'
-            ]
-            
             header_font = ExcelFont(bold=True, size=11)
             header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
             cell_alignment = Alignment(vertical='center', wrap_text=True)
@@ -909,14 +1160,14 @@ class InvoiceMainWindow(QMainWindow):
                 bottom=Side(style='thin')
             )
             
-            for col, header in enumerate(headers, 1):
+            for col, header in enumerate(selected_headers, 1):
                 cell = ws.cell(row=1, column=col, value=header)
                 cell.font = header_font
                 cell.alignment = header_alignment
                 cell.border = thin_border
             
             for row, result in enumerate(self.invoice_results, 2):
-                for col, header in enumerate(headers, 1):
+                for col, header in enumerate(selected_headers, 1):
                     value = result.get(header, '')
                     cell = ws.cell(row=row, column=col, value=str(value) if value else '')
                     cell.alignment = cell_alignment
@@ -977,6 +1228,71 @@ class InvoiceMainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, '错误', f'导出失败: {str(e)}')
+
+
+class FieldSelectDialog(QDialog):
+    """字段选择对话框"""
+    
+    def __init__(self, all_fields, default_selected, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('选择导出字段')
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(500)
+        
+        layout = QVBoxLayout(self)
+        
+        label = QLabel('请选择要导出的字段：')
+        layout.addWidget(label)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        self.checkboxes = {}
+        for field in all_fields:
+            cb = QCheckBox(field)
+            cb.setChecked(field in default_selected)
+            self.checkboxes[field] = cb
+            scroll_layout.addWidget(cb)
+        
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        btn_layout = QHBoxLayout()
+        
+        btn_select_all = QPushButton('全选')
+        btn_select_all.clicked.connect(self.select_all)
+        btn_layout.addWidget(btn_select_all)
+        
+        btn_deselect_all = QPushButton('取消全选')
+        btn_deselect_all.clicked.connect(self.deselect_all)
+        btn_layout.addWidget(btn_deselect_all)
+        
+        layout.addLayout(btn_layout)
+        
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton('确定')
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton('取消')
+        btn_cancel.clicked.connect(self.reject)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        layout.addLayout(btn_box)
+    
+    def select_all(self):
+        for cb in self.checkboxes.values():
+            cb.setChecked(True)
+    
+    def deselect_all(self):
+        for cb in self.checkboxes.values():
+            cb.setChecked(False)
+    
+    def get_selected_fields(self):
+        return [field for field, cb in self.checkboxes.items() if cb.isChecked()]
 
 
 def main():
