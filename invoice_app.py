@@ -324,41 +324,51 @@ class InvoiceParser:
             
             found = False
             
-            if existing_total_price and len(amounts) >= 2:
+            if existing_total_price and len(amounts) >= 1:
                 total_price_value = float(existing_total_price)
                 add_log(f"已有价税合计: {total_price_value}, 尝试匹配合计金额和合计税额", image_path)
                 
-                for i in range(len(amounts)):
-                    for j in range(i + 1, len(amounts)):
-                        total_amount = amounts[i]
-                        total_tax = amounts[j]
-                        
-                        if abs(total_amount + total_tax - total_price_value) < 0.01:
-                            if total_amount > total_tax:
-                                info['合计金额'] = str(total_amount)
-                                info['合计税额'] = str(total_tax)
-                                info['价税合计'] = str(total_price_value)
-                                add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
-                                found = True
-                                break
-                    if found:
+                for amount in amounts:
+                    if abs(amount - total_price_value) < 0.01:
+                        info['合计金额'] = str(amount)
+                        info['合计税额'] = '0'
+                        info['价税合计'] = str(total_price_value)
+                        add_log(f"匹配成功（税额为0）: 合计金额={amount}, 合计税额=0, 价税合计={total_price_value}", image_path)
+                        found = True
                         break
                 
-                if not found:
+                if not found and len(amounts) >= 2:
                     for i in range(len(amounts)):
                         for j in range(i + 1, len(amounts)):
-                            total_tax = amounts[i]
-                            total_amount = amounts[j]
+                            total_amount = amounts[i]
+                            total_tax = amounts[j]
                             
                             if abs(total_amount + total_tax - total_price_value) < 0.01:
-                                info['合计金额'] = str(total_amount)
-                                info['合计税额'] = str(total_tax)
-                                info['价税合计'] = str(total_price_value)
-                                add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
-                                found = True
-                                break
+                                if total_amount > total_tax:
+                                    info['合计金额'] = str(total_amount)
+                                    info['合计税额'] = str(total_tax)
+                                    info['价税合计'] = str(total_price_value)
+                                    add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
+                                    found = True
+                                    break
                         if found:
                             break
+                    
+                    if not found:
+                        for i in range(len(amounts)):
+                            for j in range(i + 1, len(amounts)):
+                                total_tax = amounts[i]
+                                total_amount = amounts[j]
+                                
+                                if abs(total_amount + total_tax - total_price_value) < 0.01:
+                                    info['合计金额'] = str(total_amount)
+                                    info['合计税额'] = str(total_tax)
+                                    info['价税合计'] = str(total_price_value)
+                                    add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
+                                    found = True
+                                    break
+                            if found:
+                                break
             
             if not found and len(amounts) >= 3:
                 for i in range(len(amounts)):
@@ -1317,10 +1327,14 @@ class InvoiceMainWindow(QMainWindow):
         if reply == QMessageBox.No:
             return
         
+        failed_indices = [i for i, r in enumerate(self.invoice_results) if r.get('状态') == '失败']
+        for i in reversed(failed_indices):
+            if i < self.result_table.rowCount():
+                self.result_table.removeRow(i)
+        
         self.invoice_results = [r for r in self.invoice_results if r.get('状态') == '成功']
         
         if not self.invoice_results:
-            self.result_table.setRowCount(0)
             self.result_count_label.setText('共 0 条记录')
             self.btn_export.setEnabled(False)
             self.btn_clear_results.setEnabled(False)
@@ -1457,8 +1471,6 @@ class InvoiceMainWindow(QMainWindow):
             if result not in self.invoice_results:
                 self.invoice_results.append(result)
         
-        self.display_results(self.invoice_results)
-        
         self.btn_process.setEnabled(True)
         self.btn_add.setEnabled(True)
         self.btn_add_folder.setEnabled(True)
@@ -1469,7 +1481,11 @@ class InvoiceMainWindow(QMainWindow):
         self.btn_clear_results.setEnabled(True)
         
         success_count = sum(1 for r in self.invoice_results if r.get('状态') == '成功')
-        self.status_bar.showMessage(f'识别完成: 成功 {success_count} 个, 失败 {len(self.invoice_results) - success_count} 个')
+        failed_count = len(self.invoice_results) - success_count
+        self.status_bar.showMessage(f'识别完成: 成功 {success_count} 个, 失败 {failed_count} 个')
+        
+        if failed_count > 0:
+            self.btn_retry_failed.setEnabled(True)
     
     def display_results(self, results):
         if not results:
