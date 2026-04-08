@@ -324,20 +324,27 @@ class InvoiceParser:
             
             found = False
             
-            if existing_total_price and len(amounts) >= 1:
+            if existing_total_price and len(amounts) >= 2:
                 total_price_value = float(existing_total_price)
                 add_log(f"已有价税合计: {total_price_value}, 尝试匹配合计金额和合计税额", image_path)
                 
-                for amount in amounts:
-                    if abs(amount - total_price_value) < 0.01:
-                        info['合计金额'] = str(amount)
-                        info['合计税额'] = '0'
-                        info['价税合计'] = str(total_price_value)
-                        add_log(f"匹配成功（税额为0）: 合计金额={amount}, 合计税额=0, 价税合计={total_price_value}", image_path)
-                        found = True
-                        break
+                for i in range(len(amounts)):
+                    if abs(amounts[i] - total_price_value) < 0.01:
+                        for j in range(len(amounts)):
+                            if i != j:
+                                total_amount = amounts[j]
+                                total_tax = total_price_value - total_amount
+                                if total_tax >= 0:
+                                    info['合计金额'] = str(total_amount)
+                                    info['合计税额'] = str(round(total_tax, 2))
+                                    info['价税合计'] = str(total_price_value)
+                                    add_log(f"匹配成功（价税合计匹配）: 合计金额={total_amount}, 合计税额={round(total_tax, 2)}, 价税合计={total_price_value}", image_path)
+                                    found = True
+                                    break
+                        if found:
+                            break
                 
-                if not found and len(amounts) >= 2:
+                if not found:
                     for i in range(len(amounts)):
                         for j in range(i + 1, len(amounts)):
                             total_amount = amounts[i]
@@ -353,22 +360,33 @@ class InvoiceParser:
                                     break
                         if found:
                             break
-                    
-                    if not found:
-                        for i in range(len(amounts)):
-                            for j in range(i + 1, len(amounts)):
-                                total_tax = amounts[i]
-                                total_amount = amounts[j]
-                                
-                                if abs(total_amount + total_tax - total_price_value) < 0.01:
-                                    info['合计金额'] = str(total_amount)
-                                    info['合计税额'] = str(total_tax)
-                                    info['价税合计'] = str(total_price_value)
-                                    add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
-                                    found = True
-                                    break
-                            if found:
+                
+                if not found:
+                    for i in range(len(amounts)):
+                        for j in range(i + 1, len(amounts)):
+                            total_tax = amounts[i]
+                            total_amount = amounts[j]
+                            
+                            if abs(total_amount + total_tax - total_price_value) < 0.01:
+                                info['合计金额'] = str(total_amount)
+                                info['合计税额'] = str(total_tax)
+                                info['价税合计'] = str(total_price_value)
+                                add_log(f"匹配成功: 合计金额={total_amount}, 合计税额={total_tax}, 价税合计={total_price_value}", image_path)
+                                found = True
                                 break
+                        if found:
+                            break
+            
+            if not found and existing_total_price and len(amounts) >= 1:
+                total_price_value = float(existing_total_price)
+                for amount in amounts:
+                    if abs(amount - total_price_value) < 0.01:
+                        info['合计金额'] = str(amount)
+                        info['合计税额'] = '0'
+                        info['价税合计'] = str(total_price_value)
+                        add_log(f"匹配成功（税额为0）: 合计金额={amount}, 合计税额=0, 价税合计={total_price_value}", image_path)
+                        found = True
+                        break
             
             if not found and len(amounts) >= 3:
                 for i in range(len(amounts)):
